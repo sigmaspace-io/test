@@ -1,7 +1,7 @@
 use cryptoxide::{
     hashing::blake2b::{self, Blake2b},
-    kdf::argon2,
 };
+use crate::hprime;
 
 pub const DATASET_ACCESS_SIZE: usize = 64;
 
@@ -101,7 +101,7 @@ fn random_gen(gen_type: RomGenerationType, seed: [u8; 32], output: &mut [u8]) ->
         assert!(pre_size.is_power_of_two());
         let mut mixing_buffer = vec![0; pre_size];
 
-        argon2::hprime(&mut mixing_buffer, &seed);
+        hprime(&mut mixing_buffer, &seed);
 
         const OFFSET_LOOPS: u32 = 4;
 
@@ -130,7 +130,7 @@ fn random_gen(gen_type: RomGenerationType, seed: [u8; 32], output: &mut [u8]) ->
             .update(&seed)
             .update(b"generation offset base")
             .finalize();
-        argon2::hprime(&mut offsets_bytes, &offset_bytes_input);
+        hprime(&mut offsets_bytes, &offset_bytes_input);
 
         let offsets = offsets_bytes;
 
@@ -156,7 +156,7 @@ fn random_gen(gen_type: RomGenerationType, seed: [u8; 32], output: &mut [u8]) ->
         }
         RomDigest(digest.finalize())
     } else {
-        argon2::hprime(output, &seed);
+        hprime(output, &seed);
         RomDigest(Blake2b::<512>::new().update(output).finalize())
     }
 }

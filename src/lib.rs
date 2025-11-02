@@ -36,10 +36,8 @@ let digest = hash(b"salt", &rom, 8, 256);
 
 mod rom;
 
-use cryptoxide::{
-    hashing::blake2b::{self, Blake2b},
-    kdf::argon2,
-};
+use blake2b_simd::{Params, State};
+use std::ops::Deref;
 
 use self::rom::RomDigest;
 pub use self::rom::{Rom, RomGenerationType};
@@ -61,8 +59,8 @@ struct VM {
     program: Program,
     regs: [Register; NB_REGS],
     ip: u32,
-    prog_digest: blake2b::Context<512>,
-    mem_digest: blake2b::Context<512>,
+    prog_digest: State,
+    mem_digest: State,
     prog_seed: [u8; 64],
     memory_counter: u32,
     loop_counter: u32,
@@ -138,6 +136,38 @@ impl From<u8> for Operand {
         }
     }
 }
+const BLAKE2B_OUT_LENGTH: usize = 64;
+fn blake2b_self(out: &mut [u8], input: &[&[u8]]) {
+    let mut blake = Params::new().hash_length(out.len()).to_state();
+    for slice in input {
+        blake.update(slice);
+    }
+    out.copy_from_slice(blake.finalize().as_bytes());
+}
+
+pub fn hprime(out: &mut [u8], input: &[u8]) {
+    let out_len = out.len();
+    if out_len <= BLAKE2B_OUT_LENGTH {
+        blake2b_self(out, &[&u32::to_le_bytes(out_len as u32), input]);
+    } else {
+        let ai_len = 32;
+        let mut out_buffer = [0u8; BLAKE2B_OUT_LENGTH];
+        let mut in_buffer = [0u8; BLAKE2B_OUT_LENGTH];
+        blake2b_self(&mut out_buffer, &[&u32::to_le_bytes(out_len as u32), input]);
+        out[0..ai_len].clone_from_slice(&out_buffer[0..ai_len]);
+        let mut out_pos = ai_len;
+        let mut to_produce = out_len - ai_len;
+
+        while to_produce > BLAKE2B_OUT_LENGTH {
+            in_buffer.clone_from_slice(&out_buffer);
+            blake2b_self(&mut out_buffer, &[&in_buffer]);
+            out[out_pos..out_pos + ai_len].clone_from_slice(&out_buffer[0..ai_len]);
+            out_pos += ai_len;
+            to_produce -= ai_len;
+        }
+        blake2b_self(&mut out[out_pos..out_len], &[&out_buffer]);
+    }
+}
 
 impl VM {
     /// Create a new VM which is specific to the ROM by using the RomDigest,
@@ -150,7 +180,7 @@ impl VM {
 
         let mut init_buffer_input = rom_digest.0.to_vec();
         init_buffer_input.extend_from_slice(salt);
-        argon2::hprime(&mut init_buffer, &init_buffer_input);
+        hprime(&mut init_buffer, &init_buffer_input);
 
         let (init_buffer_regs, init_buffer_digests) = init_buffer.split_at(REGS_CONTENT_SIZE);
 
@@ -160,8 +190,8 @@ impl VM {
         }
 
         let mut digests = init_buffer_digests.chunks(DIGEST_INIT_SIZE);
-        let prog_digest = Blake2b::<512>::new().update(&digests.next().unwrap());
-        let mem_digest = Blake2b::<512>::new().update(&digests.next().unwrap());
+        let prog_digest = State::new().update(&digests.next().unwrap()).deref().clone();
+        let mem_digest = State::new().update(&digests.next().unwrap()).deref().clone();
         let prog_seed = *<&[u8; 64]>::try_from(digests.next().unwrap()).unwrap();
 
         assert_eq!(digests.next(), None);
@@ -203,13 +233,13 @@ impl VM {
             .update(&sum_regs.to_le_bytes())
             .finalize();
 
-        let mixing_value = Blake2b::<512>::new()
-            .update(&prog_value)
-            .update(&mem_value)
+        let mixing_value = State::new()
+            .update(&prog_value.as_bytes())
+            .update(&mem_value.as_bytes())
             .update(&self.loop_counter.to_le_bytes())
             .finalize();
         let mut mixing_out = vec![0; NB_REGS * REGISTER_SIZE * 32];
-        argon2::hprime(&mut mixing_out, &mixing_value);
+        hprime(&mut mixing_out, &mixing_value.as_bytes());
 
         for mem_chunks in mixing_out.chunks(NB_REGS * REGISTER_SIZE) {
             for (reg, reg_chunk) in self.regs.iter_mut().zip(mem_chunks.chunks(8)) {
@@ -217,7 +247,7 @@ impl VM {
             }
         }
 
-        self.prog_seed = prog_value;
+        self.prog_seed = *prog_value.as_array();
         self.loop_counter = self.loop_counter.wrapping_add(1)
     }
 
@@ -232,14 +262,17 @@ impl VM {
     pub fn finalize(self) -> [u8; 64] {
         let prog_digest = self.prog_digest.finalize();
         let mem_digest = self.mem_digest.finalize();
-        let mut context = Blake2b::<512>::new()
-            .update(&prog_digest)
-            .update(&mem_digest)
-            .update(&self.memory_counter.to_le_bytes());
+        let mut context = State::new()
+            .update(&prog_digest.as_bytes())
+            .update(&mem_digest.as_bytes())
+            .update(&self.memory_counter.to_le_bytes())
+            .deref()
+            .clone();
         for r in self.regs {
-            context.update_mut(&r.to_le_bytes());
+            context.update(&r.to_le_bytes());
         }
-        context.finalize()
+        let i = context.finalize();
+        *i.as_array()
     }
 
     #[allow(dead_code)]
@@ -273,7 +306,7 @@ impl Program {
     }
 
     pub fn shuffle(&mut self, seed: &[u8; 64]) {
-        argon2::hprime(&mut self.instructions, seed)
+        hprime(&mut self.instructions, seed)
     }
 }
 
@@ -321,7 +354,7 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
     macro_rules! mem_access64 {
         ($vm:ident, $rom:ident, $addr:ident) => {{
             let mem = rom.at($addr as u32);
-            $vm.mem_digest.update_mut(mem);
+            $vm.mem_digest.update(mem);
             $vm.memory_counter = $vm.memory_counter.wrapping_add(1);
 
             // divide memory access into 8 chunks of 8 bytes
@@ -333,14 +366,16 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
     macro_rules! special1_value64 {
         ($vm:ident) => {{
             let r = $vm.prog_digest.clone().finalize();
-            u64::from_le_bytes(*<&[u8; 8]>::try_from(&r[0..8]).unwrap())
+            let i = r.as_bytes();
+            u64::from_le_bytes(*<&[u8; 8]>::try_from(&i[0..8]).unwrap())
         }};
     }
 
     macro_rules! special2_value64 {
         ($vm:ident) => {{
             let r = $vm.mem_digest.clone().finalize();
-            u64::from_le_bytes(*<&[u8; 8]>::try_from(&r[0..8]).unwrap())
+            let i = r.as_bytes();
+            u64::from_le_bytes(*<&[u8; 8]>::try_from(&i[0..8]).unwrap())
         }};
     }
 
@@ -394,11 +429,11 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
                 Op3::And => src1 & src2,
                 Op3::Hash(v) => {
                     assert!(v < 8);
-                    let out = Blake2b::<512>::new()
+                    let out = State::new()
                         .update(&src1.to_le_bytes())
                         .update(&src2.to_le_bytes())
                         .finalize();
-                    if let Some(chunk) = out.chunks(8).nth(v as usize) {
+                    if let Some(chunk) = out.as_array().chunks(8).nth(v as usize) {
                         u64::from_le_bytes(*<&[u8; 8]>::try_from(chunk).unwrap())
                     } else {
                         panic!("chunk doesn't exist")
@@ -427,7 +462,7 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
             vm.regs[r3 as usize] = result;
         }
     }
-    vm.prog_digest.update_mut(&prog_chunk);
+    vm.prog_digest.update(&prog_chunk);
 }
 
 /// For the given [`Rom`] and parameter, compute the digest of the given `salt`
