@@ -64,6 +64,7 @@ struct VM {
     prog_seed: [u8; 64],
     memory_counter: u32,
     loop_counter: u32,
+    mixing_buffer: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -178,7 +179,8 @@ impl VM {
 
         let mut init_buffer = [0; REGS_CONTENT_SIZE + 3 * DIGEST_INIT_SIZE];
 
-        let mut init_buffer_input = rom_digest.0.to_vec();
+        let mut init_buffer_input = Vec::with_capacity(rom_digest.0.len() + salt.len());
+        init_buffer_input.extend_from_slice(&rom_digest.0);
         init_buffer_input.extend_from_slice(salt);
         hprime(&mut init_buffer, &init_buffer_input);
 
@@ -198,6 +200,8 @@ impl VM {
 
         let program = Program::new(nb_instrs);
 
+        let mixing_buffer = vec![0; NB_REGS * REGISTER_SIZE * 32];
+
         Self {
             program,
             regs,
@@ -207,6 +211,7 @@ impl VM {
             ip: 0,
             loop_counter: 0,
             memory_counter: 0,
+            mixing_buffer,
         }
     }
 
@@ -238,12 +243,12 @@ impl VM {
             .update(&mem_value.as_bytes())
             .update(&self.loop_counter.to_le_bytes())
             .finalize();
-        let mut mixing_out = vec![0; NB_REGS * REGISTER_SIZE * 32];
-        hprime(&mut mixing_out, &mixing_value.as_bytes());
-
-        for mem_chunks in mixing_out.chunks(NB_REGS * REGISTER_SIZE) {
+        hprime(&mut self.mixing_buffer, &mixing_value.as_bytes());
+        for mem_chunks in self.mixing_buffer.chunks_exact(NB_REGS * REGISTER_SIZE) {
             for (reg, reg_chunk) in self.regs.iter_mut().zip(mem_chunks.chunks(8)) {
-                *reg ^= u64::from_le_bytes(*<&[u8; 8]>::try_from(reg_chunk).unwrap())
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(reg_chunk);
+                *reg ^= u64::from_le_bytes(bytes)
             }
         }
 
@@ -300,9 +305,9 @@ impl Program {
         Self { instructions }
     }
 
-    pub fn at(&self, i: u32) -> &[u8; INSTR_SIZE] {
+    pub fn at(&self, i: u32) -> &[u8] {
         let start = (i as usize).wrapping_mul(INSTR_SIZE) % self.instructions.len();
-        <&[u8; INSTR_SIZE]>::try_from(&self.instructions[start..start + INSTR_SIZE]).unwrap()
+        &self.instructions[start..start + INSTR_SIZE]
     }
 
     pub fn shuffle(&mut self, seed: &[u8; 64]) {
@@ -323,7 +328,7 @@ pub struct Instruction {
 }
 
 #[inline]
-fn decode_instruction(instruction: &[u8; INSTR_SIZE]) -> Instruction {
+fn decode_instruction(instruction: &[u8]) -> Instruction {
     let opcode = Instr::from(instruction[0]);
     let op1 = Operand::from(instruction[1] >> 4);
     let op2 = Operand::from(instruction[1] & 0x0f);
@@ -333,8 +338,12 @@ fn decode_instruction(instruction: &[u8; INSTR_SIZE]) -> Instruction {
     let r2 = ((rs >> REGS_BITS) as u8) & REGS_INDEX_MASK;
     let r3 = (rs as u8) & REGS_INDEX_MASK;
 
-    let lit1 = u64::from_le_bytes(*<&[u8; 8]>::try_from(&instruction[4..12]).unwrap());
-    let lit2 = u64::from_le_bytes(*<&[u8; 8]>::try_from(&instruction[12..20]).unwrap());
+    let mut lit1_bytes = [0u8; 8];
+    lit1_bytes.copy_from_slice(&instruction[4..12]);
+    let lit1 = u64::from_le_bytes(lit1_bytes);
+    let mut lit2_bytes = [0u8; 8];
+    lit2_bytes.copy_from_slice(&instruction[12..20]);
+    let lit2 = u64::from_le_bytes(lit2_bytes);
 
     Instruction {
         opcode,
@@ -349,7 +358,7 @@ fn decode_instruction(instruction: &[u8; INSTR_SIZE]) -> Instruction {
 }
 
 fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
-    let prog_chunk = *vm.program.at(vm.ip);
+    let prog_chunk = vm.program.at(vm.ip);
 
     macro_rules! mem_access64 {
         ($vm:ident, $rom:ident, $addr:ident) => {{
@@ -359,7 +368,9 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
 
             // divide memory access into 8 chunks of 8 bytes
             let idx = (($vm.memory_counter % (64 / 8)) as usize) * 8;
-            u64::from_le_bytes(*<&[u8; 8]>::try_from(&mem[idx..idx + 8]).unwrap())
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&mem[idx..idx + 8]);
+            u64::from_le_bytes(bytes)
         }};
     }
 
@@ -388,7 +399,7 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
         r3,
         lit1,
         lit2,
-    } = decode_instruction(&prog_chunk);
+    } = decode_instruction(prog_chunk);
 
     match opcode {
         Instr::Op3(operator) => {
